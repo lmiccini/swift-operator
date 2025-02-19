@@ -51,6 +51,17 @@ func SecretTemplates(
 	templateParameters["KeystoneRegion"] = keystoneRegion
 	templateParameters["TransportURL"] = transportURL
 
+	// MTLS params
+	if mc.Status.MTLSCert != "" {
+		templateParameters["MemcachedAuthCert"] = fmt.Sprintf(memcachedv1.CertMountPath())
+		templateParameters["MemcachedAuthKey"] = fmt.Sprintf(memcachedv1.KeyMountPath())
+		templateParameters["MemcachedAuthCa"] = fmt.Sprintf(memcachedv1.CaMountPath())
+	} else {
+		templateParameters["MemcachedAuthCert"] = ""
+		templateParameters["MemcachedAuthKey"] = ""
+		templateParameters["MemcachedAuthCa"] = ""
+	}
+
 	// create httpd  vhost template parameters
 	httpdVhostConfig := map[string]interface{}{}
 	for _, endpt := range []service.Endpoint{service.EndpointInternal, service.EndpointPublic} {
