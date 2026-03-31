@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -312,7 +314,8 @@ func (r *SwiftProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	apiEndpoints := make(map[string]string)
 
-	for endpointType, data := range swiftPorts {
+	for _, endpointType := range slices.Sorted(maps.Keys(swiftPorts)) {
+		data := swiftPorts[endpointType]
 		endpointTypeStr := string(endpointType)
 		endpointName := swift.ServiceName + "-" + endpointTypeStr
 		svcOverride := instance.Spec.Override.Service[endpointType]
