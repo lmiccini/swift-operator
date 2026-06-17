@@ -25,4 +25,8 @@ const (
 
 	// ACConsumerFinalizer is added to AC secrets that SwiftProxy is actively consuming
 	ACConsumerFinalizer = "openstack.org/swiftproxy-ac-consumer"
+
+	// TransportConsumerFinalizer is added to transport secrets that SwiftProxy is
+	// actively consuming, preventing premature deletion during credential rotation
+	TransportConsumerFinalizer = "openstack.org/swift-transport-consumer"
 )

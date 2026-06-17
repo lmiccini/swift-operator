@@ -265,12 +265,14 @@ func (r *SwiftProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	instance.Status.Conditions.MarkTrue(condition.TLSInputReadyCondition, condition.InputReadyMessage)
 
 	transportURLString := ""
+	var transportURL *rabbitmqv1.TransportURL
 	if instance.Spec.CeilometerEnabled {
 		//
 		// create RabbitMQ transportURL CR and get the actual URL from the associated secret that is created
 		//
 
-		transportURL, op, err := r.transportURLCreateOrUpdate(ctx, instance, serviceLabels)
+		var op controllerutil.OperationResult
+		transportURL, op, err = r.transportURLCreateOrUpdate(ctx, instance, serviceLabels)
 		if err != nil {
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				condition.InputReadyCondition,
@@ -285,14 +287,20 @@ func (r *SwiftProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			Log.Info(fmt.Sprintf("TransportURL %s successfully reconciled - operation: %s", transportURL.Name, string(op)))
 		}
 
-		instance.Status.TransportURLSecret = transportURL.Status.SecretName
-
-		if instance.Status.TransportURLSecret == "" {
+		if transportURL.Status.SecretName == "" {
 			Log.Info(fmt.Sprintf("Waiting for TransportURL %s secret to be created", transportURL.Name))
 			return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
 		}
 
-		transportURLSecret, _, err := secret.GetSecret(ctx, helper, instance.Status.TransportURLSecret, instance.Namespace)
+		if err := rabbitmqv1.ManageTransportSecretFinalizer(
+			ctx, helper, instance.Namespace,
+			transportURL.Status.SecretName,
+			swiftproxy.TransportConsumerFinalizer,
+		); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		transportURLSecret, _, err := secret.GetSecret(ctx, helper, transportURL.Status.SecretName, instance.Namespace)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -825,6 +833,29 @@ func (r *SwiftProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		instance.Status.ApplicationCredentialSecret = instance.Spec.Auth.ApplicationCredentialSecret
 	}
 
+	// Remove the previous transport secret's consumer finalizer only after all
+	// conditions are True (deployment rolled out with the new secret) and only
+	// when this is NOT the very first time we see the new secret (rotation).
+	if transportURL != nil {
+		isTransportRotation := instance.Status.TransportURLSecret != "" &&
+			instance.Status.TransportURLSecret != transportURL.Status.SecretName
+
+		if isTransportRotation {
+			if instance.Status.Conditions.AllSubConditionIsTrue() {
+				if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
+					ctx, helper, instance.Namespace,
+					instance.Status.TransportURLSecret,
+					swiftproxy.TransportConsumerFinalizer,
+				); err != nil {
+					return ctrl.Result{}, err
+				}
+				instance.Status.TransportURLSecret = transportURL.Status.SecretName
+			}
+		} else {
+			instance.Status.TransportURLSecret = transportURL.Status.SecretName
+		}
+	}
+
 	// We reached the end of the Reconcile, update the Ready condition based on
 	// the sub conditions
 	if instance.Status.Conditions.AllSubConditionIsTrue() {
@@ -1076,6 +1107,24 @@ func (r *SwiftProxyReconciler) reconcileDelete(ctx context.Context, instance *sw
 			secretName, swiftproxy.ACConsumerFinalizer); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+
+	transportSecretName := instance.Status.TransportURLSecret
+	if transportSecretName == "" {
+		transportURL := &rabbitmqv1.TransportURL{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      fmt.Sprintf("%s-swift-transport", instance.Name),
+			Namespace: instance.Namespace,
+		}, transportURL); err == nil {
+			transportSecretName = transportURL.Status.SecretName
+		}
+	}
+	if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
+		ctx, helper, instance.Namespace,
+		transportSecretName,
+		swiftproxy.TransportConsumerFinalizer,
+	); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Remove finalizer on the Topology CR
