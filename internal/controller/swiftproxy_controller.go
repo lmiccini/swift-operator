@@ -833,27 +833,23 @@ func (r *SwiftProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		instance.Status.ApplicationCredentialSecret = instance.Spec.Auth.ApplicationCredentialSecret
 	}
 
-	// Remove the previous transport secret's consumer finalizer only after all
-	// conditions are True (deployment rolled out with the new secret) and only
-	// when this is NOT the very first time we see the new secret (rotation).
+	// Finalize transport secret rotation: remove old secret's consumer
+	// finalizer only after the deployment is fully rolled out and all
+	// conditions are True.
 	if transportURL != nil {
-		isTransportRotation := instance.Status.TransportURLSecret != "" &&
-			instance.Status.TransportURLSecret != transportURL.Status.SecretName
+		allSubCRsStable := deployment.IsReady(deploy)
 
-		if isTransportRotation {
-			if instance.Status.Conditions.AllSubConditionIsTrue() {
-				if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
-					ctx, helper, instance.Namespace,
-					instance.Status.TransportURLSecret,
-					swiftproxy.TransportConsumerFinalizer,
-				); err != nil {
-					return ctrl.Result{}, err
-				}
-				instance.Status.TransportURLSecret = transportURL.Status.SecretName
-			}
-		} else {
-			instance.Status.TransportURLSecret = transportURL.Status.SecretName
+		secretName, err := rabbitmqv1.FinalizeTransportSecretRotation(
+			ctx, helper, instance.Namespace,
+			instance.Status.TransportURLSecret,
+			transportURL.Status.SecretName,
+			swiftproxy.TransportConsumerFinalizer,
+			allSubCRsStable && instance.Status.Conditions.AllSubConditionIsTrue(),
+		)
+		if err != nil {
+			return ctrl.Result{}, err
 		}
+		instance.Status.TransportURLSecret = secretName
 	}
 
 	// We reached the end of the Reconcile, update the Ready condition based on
