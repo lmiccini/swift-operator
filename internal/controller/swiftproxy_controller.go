@@ -53,6 +53,7 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
 	nad "github.com/openstack-k8s-operators/lib-common/modules/common/networkattachment"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/object"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	service "github.com/openstack-k8s-operators/lib-common/modules/common/service"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
@@ -265,12 +266,14 @@ func (r *SwiftProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	instance.Status.Conditions.MarkTrue(condition.TLSInputReadyCondition, condition.InputReadyMessage)
 
 	transportURLString := ""
+	var transportURL *rabbitmqv1.TransportURL
 	if instance.Spec.CeilometerEnabled {
 		//
 		// create RabbitMQ transportURL CR and get the actual URL from the associated secret that is created
 		//
 
-		transportURL, op, err := r.transportURLCreateOrUpdate(ctx, instance, serviceLabels)
+		var op controllerutil.OperationResult
+		transportURL, op, err = r.transportURLCreateOrUpdate(ctx, instance, serviceLabels)
 		if err != nil {
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				condition.InputReadyCondition,
@@ -285,14 +288,17 @@ func (r *SwiftProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			Log.Info(fmt.Sprintf("TransportURL %s successfully reconciled - operation: %s", transportURL.Name, string(op)))
 		}
 
-		instance.Status.TransportURLSecret = transportURL.Status.SecretName
-
-		if instance.Status.TransportURLSecret == "" {
+		if transportURL.Status.SecretName == "" {
 			Log.Info(fmt.Sprintf("Waiting for TransportURL %s secret to be created", transportURL.Name))
 			return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
 		}
 
-		transportURLSecret, _, err := secret.GetSecret(ctx, helper, instance.Status.TransportURLSecret, instance.Namespace)
+		if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+			transportURL.Status.SecretName, swiftproxy.TransportConsumerFinalizer); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		transportURLSecret, _, err := secret.GetSecret(ctx, helper, transportURL.Status.SecretName, instance.Namespace)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -662,9 +668,8 @@ func (r *SwiftProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// The old secret's finalizer is removed later (after all services deploy)
 	// so that rapid rotations don't revoke a credential still in use by pods.
 	if instance.Spec.Auth.ApplicationCredentialSecret != "" {
-		if err := keystonev1.ManageACSecretFinalizer(ctx, helper, instance.Namespace,
+		if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 			instance.Spec.Auth.ApplicationCredentialSecret,
-			"",
 			swiftproxy.ACConsumerFinalizer); err != nil {
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				condition.ServiceConfigReadyCondition,
@@ -806,24 +811,39 @@ func (r *SwiftProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			condition.SeverityInfo,
 			condition.DeploymentReadyRunningMessage))
 	}
-	// Manage the old AC secret's finalizer and status tracking.
-	// On rotation (old != new), only remove the old secret's finalizer after
-	// all sub-services are ready with the new credentials. This prevents
-	// premature revocation during rapid rotations.
-	isRotation := instance.Status.ApplicationCredentialSecret != "" && instance.Status.ApplicationCredentialSecret != instance.Spec.Auth.ApplicationCredentialSecret
+	// Finalize transport secret rotation: remove old secret's consumer
+	// finalizer only after the deployment is fully rolled out and all
+	// conditions are True.
+	if transportURL != nil {
+		guardReady := condition.CredentialRotationGuardReady(
+			deployment.IsReady(deploy), &instance.Status.Conditions)
 
-	if isRotation {
-		allServicesReady := instance.Status.Conditions.AllSubConditionIsTrue()
-		if allServicesReady {
-			if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
-				instance.Status.ApplicationCredentialSecret, swiftproxy.ACConsumerFinalizer); err != nil {
-				return ctrl.Result{}, err
-			}
-			instance.Status.ApplicationCredentialSecret = instance.Spec.Auth.ApplicationCredentialSecret
+		secretName, err := object.FinalizeSecretRotation(
+			ctx, helper, instance.Namespace,
+			instance.Status.TransportURLSecret,
+			transportURL.Status.SecretName,
+			swiftproxy.TransportConsumerFinalizer,
+			guardReady,
+		)
+		if err != nil {
+			return ctrl.Result{}, err
 		}
-	} else {
-		instance.Status.ApplicationCredentialSecret = instance.Spec.Auth.ApplicationCredentialSecret
+		instance.Status.TransportURLSecret = secretName
 	}
+
+	guardReady := condition.CredentialRotationGuardReady(true, &instance.Status.Conditions)
+
+	acSecretName, err := object.FinalizeSecretRotation(
+		ctx, helper, instance.Namespace,
+		instance.Status.ApplicationCredentialSecret,
+		instance.Spec.Auth.ApplicationCredentialSecret,
+		swiftproxy.ACConsumerFinalizer,
+		guardReady,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	instance.Status.ApplicationCredentialSecret = acSecretName
 
 	// We reached the end of the Reconcile, update the Ready condition based on
 	// the sub conditions
@@ -1072,10 +1092,26 @@ func (r *SwiftProxyReconciler) reconcileDelete(ctx context.Context, instance *sw
 		instance.Status.ApplicationCredentialSecret,
 		instance.Spec.Auth.ApplicationCredentialSecret,
 	} {
-		if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 			secretName, swiftproxy.ACConsumerFinalizer); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+
+	// Remove consumer finalizer from transport secret SwiftProxy was consuming.
+	transportSecretName := instance.Status.TransportURLSecret
+	if transportSecretName == "" {
+		transportURLObj := &rabbitmqv1.TransportURL{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      fmt.Sprintf("%s-swift-transport", instance.Name),
+			Namespace: instance.Namespace,
+		}, transportURLObj); err == nil {
+			transportSecretName = transportURLObj.Status.SecretName
+		}
+	}
+	if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		transportSecretName, swiftproxy.TransportConsumerFinalizer); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Remove finalizer on the Topology CR
