@@ -53,6 +53,7 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
 	nad "github.com/openstack-k8s-operators/lib-common/modules/common/networkattachment"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/object"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	service "github.com/openstack-k8s-operators/lib-common/modules/common/service"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
@@ -70,8 +71,9 @@ import (
 // SwiftProxyReconciler reconciles a SwiftProxy object
 type SwiftProxyReconciler struct {
 	client.Client
-	Scheme  *runtime.Scheme
-	Kclient kubernetes.Interface
+	Scheme    *runtime.Scheme
+	Kclient   kubernetes.Interface
+	APIReader client.Reader
 }
 
 // GetLogger returns a logger object with a prefix of "controller.name" and additional controller context fields
@@ -265,12 +267,14 @@ func (r *SwiftProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	instance.Status.Conditions.MarkTrue(condition.TLSInputReadyCondition, condition.InputReadyMessage)
 
 	transportURLString := ""
+	var transportURL *rabbitmqv1.TransportURL
 	if instance.Spec.CeilometerEnabled {
 		//
 		// create RabbitMQ transportURL CR and get the actual URL from the associated secret that is created
 		//
 
-		transportURL, op, err := r.transportURLCreateOrUpdate(ctx, instance, serviceLabels)
+		var op controllerutil.OperationResult
+		transportURL, op, err = r.transportURLCreateOrUpdate(ctx, instance, serviceLabels)
 		if err != nil {
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				condition.InputReadyCondition,
@@ -285,14 +289,17 @@ func (r *SwiftProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			Log.Info(fmt.Sprintf("TransportURL %s successfully reconciled - operation: %s", transportURL.Name, string(op)))
 		}
 
-		instance.Status.TransportURLSecret = transportURL.Status.SecretName
-
-		if instance.Status.TransportURLSecret == "" {
+		if transportURL.Status.SecretName == "" {
 			Log.Info(fmt.Sprintf("Waiting for TransportURL %s secret to be created", transportURL.Name))
 			return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
 		}
 
-		transportURLSecret, _, err := secret.GetSecret(ctx, helper, instance.Status.TransportURLSecret, instance.Namespace)
+		if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+			transportURL.Status.SecretName, swiftproxy.TransportConsumerFinalizer); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		transportURLSecret, _, err := secret.GetSecret(ctx, helper, transportURL.Status.SecretName, instance.Namespace)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -650,21 +657,16 @@ func (r *SwiftProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// create hash over all the different input resources to identify if any those changed
 	// and a restart/recreate is required.
-	inputHash, hashChanged, err := r.createHashOfInputHashes(instance, envVars)
+	inputHash, _, err := r.createHashOfInputHashes(instance, envVars)
 	if err != nil {
 		return ctrl.Result{}, err
-	} else if hashChanged {
-		// Hash changed and instance status should be updated (which will be done by main defer func),
-		// so we need to return and reconcile again
-		return ctrl.Result{}, nil
 	}
 	// Add consumer finalizer to the new AC secret early, before deployment.
 	// The old secret's finalizer is removed later (after all services deploy)
 	// so that rapid rotations don't revoke a credential still in use by pods.
 	if instance.Spec.Auth.ApplicationCredentialSecret != "" {
-		if err := keystonev1.ManageACSecretFinalizer(ctx, helper, instance.Namespace,
+		if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 			instance.Spec.Auth.ApplicationCredentialSecret,
-			"",
 			swiftproxy.ACConsumerFinalizer); err != nil {
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				condition.ServiceConfigReadyCondition,
@@ -771,13 +773,16 @@ func (r *SwiftProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		instance.Status.ReadyCount = deploy.Status.ReadyReplicas
 	}
 
-	// Mark the Deployment as Ready only if the number of Replicas is equals
-	// to the Deployed instances (ReadyCount), and the the Status.Replicas
-	// match Status.ReadyReplicas. If a deployment update is in progress,
-	// Replicas > ReadyReplicas.
-	// In addition, make sure the controller sees the last Generation
-	// by comparing it with the ObservedGeneration.
+	ready := false
 	if deployment.IsReady(deploy) {
+		ready, err = deployment.IsReadyForInput(ctx, r.APIReader,
+			types.NamespacedName{Name: deploy.Name, Namespace: deploy.Namespace},
+			inputHash)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if ready {
 		// verify if network attachment matches expectations
 		networkReady, networkAttachmentStatus, err := nad.VerifyNetworkStatusFromAnnotation(ctx, helper, instance.Spec.NetworkAttachments, serviceLabels, instance.Status.ReadyCount)
 		if err != nil {
@@ -806,24 +811,35 @@ func (r *SwiftProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			condition.SeverityInfo,
 			condition.DeploymentReadyRunningMessage))
 	}
-	// Manage the old AC secret's finalizer and status tracking.
-	// On rotation (old != new), only remove the old secret's finalizer after
-	// all sub-services are ready with the new credentials. This prevents
-	// premature revocation during rapid rotations.
-	isRotation := instance.Status.ApplicationCredentialSecret != "" && instance.Status.ApplicationCredentialSecret != instance.Spec.Auth.ApplicationCredentialSecret
+	if transportURL != nil {
+		guardReady := ready && instance.Status.Conditions.AllSubConditionIsTrue()
 
-	if isRotation {
-		allServicesReady := instance.Status.Conditions.AllSubConditionIsTrue()
-		if allServicesReady {
-			if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
-				instance.Status.ApplicationCredentialSecret, swiftproxy.ACConsumerFinalizer); err != nil {
-				return ctrl.Result{}, err
-			}
-			instance.Status.ApplicationCredentialSecret = instance.Spec.Auth.ApplicationCredentialSecret
+		secretName, err := object.FinalizeSecretRotation(
+			ctx, helper, instance.Namespace,
+			instance.Status.TransportURLSecret,
+			transportURL.Status.SecretName,
+			swiftproxy.TransportConsumerFinalizer,
+			guardReady,
+		)
+		if err != nil {
+			return ctrl.Result{}, err
 		}
-	} else {
-		instance.Status.ApplicationCredentialSecret = instance.Spec.Auth.ApplicationCredentialSecret
+		instance.Status.TransportURLSecret = secretName
 	}
+
+	guardReady := ready && instance.Status.Conditions.AllSubConditionIsTrue()
+
+	acSecretName, err := object.FinalizeSecretRotation(
+		ctx, helper, instance.Namespace,
+		instance.Status.ApplicationCredentialSecret,
+		instance.Spec.Auth.ApplicationCredentialSecret,
+		swiftproxy.ACConsumerFinalizer,
+		guardReady,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	instance.Status.ApplicationCredentialSecret = acSecretName
 
 	// We reached the end of the Reconcile, update the Ready condition based on
 	// the sub conditions
@@ -1072,8 +1088,30 @@ func (r *SwiftProxyReconciler) reconcileDelete(ctx context.Context, instance *sw
 		instance.Status.ApplicationCredentialSecret,
 		instance.Spec.Auth.ApplicationCredentialSecret,
 	} {
-		if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 			secretName, swiftproxy.ACConsumerFinalizer); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Remove consumer finalizer from transport secret SwiftProxy was consuming.
+	// Check both the status field and the live TransportURL CR to handle
+	// mid-rotation deletes where the old and new secrets may differ.
+	transportSecrets := []string{instance.Status.TransportURLSecret}
+	tu := &rabbitmqv1.TransportURL{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      fmt.Sprintf("%s-swift-transport", instance.Name),
+		Namespace: instance.Namespace,
+	}, tu); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+	} else {
+		transportSecrets = append(transportSecrets, tu.Status.SecretName)
+	}
+	for _, secretName := range transportSecrets {
+		if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+			secretName, swiftproxy.TransportConsumerFinalizer); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
